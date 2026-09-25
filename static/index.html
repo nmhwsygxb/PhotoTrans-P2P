@@ -30,7 +30,7 @@ h1 { font-size: 22px; margin-bottom: 4px; }
 </head>
 <body>
 <h1>🌐 PhotoTrans-P2P</h1>
-<div class="sub">WebRTC 直连下载 · 免费无隧道限速</div>
+<div class="sub">手机浏览器免装 App · Cloudflare 免费中继 + WebRTC 加速</div>
 
 <div class="card">
     <h3>连接状态</h3>
@@ -82,6 +82,50 @@ function fmtSize(n) {
     return n + " B";
 }
 
+// 页面内下载：fetch 流式读取 -> blob -> 保存，避免浏览器导航到二进制地址导致白屏，并显示实时进度
+async function downloadFile(name, btn) {
+    btn.disabled = true;
+    btn.textContent = "准备...";
+    btn.style.background = "#6c757d";
+    try {
+        const res = await fetch("/download/" + encodeURIComponent(name));
+        if (!res.ok) throw new Error("HTTP " + res.status);
+        const total = parseInt(res.headers.get("Content-Length") || "0", 10);
+        const reader = res.body.getReader();
+        const chunks = [];
+        let received = 0;
+        while (true) {
+            const {done, value} = await reader.read();
+            if (done) break;
+            if (value) {
+                chunks.push(value);
+                received += value.length;
+                if (total > 0) {
+                    const pct = Math.round((received / total) * 100);
+                    btn.textContent = pct + "%";
+                }
+            }
+        }
+        const blob = new Blob(chunks);
+        const url = URL.createObjectURL(blob);
+        const a = document.createElement("a");
+        a.href = url;
+        a.download = name;          // 保留原文件名（含中文）
+        document.body.appendChild(a);
+        a.click();
+        a.remove();
+        setTimeout(() => URL.revokeObjectURL(url), 20000);
+        btn.textContent = "已下载";
+        btn.style.background = "#28a745";
+        log("文件已下载: " + name + " (" + fmtSize(total) + ")");
+    } catch (e) {
+        btn.disabled = false;
+        btn.textContent = "下载";
+        btn.style.background = "#007bff";
+        log("下载失败: " + e.message, "e");
+    }
+}
+
 async function loadFiles() {
     const el = document.getElementById("file-list");
     try {
@@ -97,14 +141,15 @@ async function loadFiles() {
             row.className = "row";
             const info = document.createElement("span");
             info.innerHTML = f.name + " <span style='color:#999;font-size:12px'>" + fmtSize(f.size) + "</span>";
-            const a = document.createElement("a");
-            a.className = "btn";
-            a.href = "/download/" + encodeURIComponent(f.name);
-            a.textContent = "下载";
-            a.style.margin = "0";
-            a.style.padding = "6px 14px";
+            const btn = document.createElement("button");
+            btn.className = "btn";
+            btn.textContent = "下载";
+            btn.style.margin = "0";
+            btn.style.padding = "6px 14px";
+            btn.style.fontSize = "13px";
+            btn.onclick = function () { downloadFile(f.name, this); };
             row.appendChild(info);
-            row.appendChild(a);
+            row.appendChild(btn);
             el.appendChild(row);
         });
     } catch (e) {

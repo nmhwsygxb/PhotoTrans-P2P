@@ -1,0 +1,299 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>PhotoTrans-P2P</title>
+<style>
+* { box-sizing: border-box; }
+body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif; max-width: 640px; margin: 0 auto; padding: 16px; line-height: 1.5; }
+h1 { font-size: 22px; margin-bottom: 4px; }
+.sub { color: #666; font-size: 13px; margin-bottom: 16px; }
+.card { background: #f7f7f8; border: 1px solid #e1e1e6; border-radius: 8px; padding: 14px; margin: 10px 0; }
+.card h3 { margin: 0 0 8px 0; font-size: 14px; color: #333; }
+.row { display: flex; justify-content: space-between; align-items: center; padding: 6px 0; border-bottom: 1px solid #eee; }
+.row:last-child { border-bottom: none; }
+.status { display: inline-block; padding: 3px 10px; border-radius: 12px; font-size: 12px; font-weight: 500; }
+.ok { background: #d4edda; color: #155724; }
+.warn { background: #fff3cd; color: #856404; }
+.err { background: #f8d7da; color: #721c24; }
+.info { background: #d1ecf1; color: #0c5460; }
+.btn { display: inline-block; padding: 10px 18px; margin: 6px; background: #007bff; color: white; border: none; border-radius: 6px; font-size: 14px; cursor: pointer; }
+.btn:disabled { background: #ccc; cursor: not-allowed; }
+.btn.green { background: #28a745; }
+.btn.gray { background: #6c757d; }
+.log { background: #1e1e1e; color: #0f0; font-family: monospace; font-size: 12px; padding: 10px; border-radius: 4px; max-height: 200px; overflow-y: auto; }
+.log .e { color: #f55; }
+.log .i { color: #5cf; }
+.hint { color: #999; font-size: 12px; margin-top: 6px; }
+</style>
+</head>
+<body>
+<h1>🌐 PhotoTrans-P2P</h1>
+<div class="sub">WebRTC 直连下载 · 免费无隧道限速</div>
+
+<div class="card">
+    <h3>连接状态</h3>
+    <div class="row"><span>WebSocket 信令</span><span class="status warn" id="ws-status">未连接</span></div>
+    <div class="row"><span>WebRTC 通道</span><span class="status warn" id="rtc-status">未建立</span></div>
+    <div class="row"><span>ICE 连接</span><span class="status warn" id="ice-status">未开始</span></div>
+    <div class="row"><span>P2P 数据通道</span><span class="status warn" id="ch-status">未建立</span></div>
+</div>
+
+<div class="card">
+    <h3>操作</h3>
+    <button class="btn green" id="btn-connect" onclick="connect()">连接</button>
+    <button class="btn gray" id="btn-disconnect" onclick="disconnect()" disabled>断开</button>
+    <button class="btn" id="btn-test" onclick="sendTest()" disabled>发送测试消息</button>
+    <div class="hint">点「连接」启动 WebSocket + WebRTC 打洞，成功即直连</div>
+</div>
+
+<div class="card">
+    <h3>文件下载 <span style="font-size:12px;color:#999;">（经 Cloudflare 中继，无需打洞）</span></h3>
+    <div id="file-list"><div class="hint">加载中...</div></div>
+</div>
+
+<div class="card">
+    <h3>消息日志</h3>
+    <div class="log" id="log"><div class="i">等待连接...</div></div>
+</div>
+
+<script>
+let ws = null, pc = null, channel = null;
+
+const STUN = [
+    {urls: "stun:162.159.207.0:3478"},
+    {urls: "stun:stun.cloudflare.com:3478"},
+];
+
+function log(msg, cls) {
+    const el = document.getElementById("log");
+    const div = document.createElement("div");
+    div.className = cls || "i";
+    div.textContent = "[" + new Date().toLocaleTimeString() + "] " + msg;
+    el.appendChild(div);
+    el.scrollTop = el.scrollHeight;
+}
+
+function fmtSize(n) {
+    if (n >= 1073741824) return (n / 1073741824).toFixed(2) + " GB";
+    if (n >= 1048576) return (n / 1048576).toFixed(1) + " MB";
+    if (n >= 1024) return (n / 1024).toFixed(1) + " KB";
+    return n + " B";
+}
+
+async function loadFiles() {
+    const el = document.getElementById("file-list");
+    try {
+        const res = await fetch("/api/files");
+        const data = await res.json();
+        if (!data.files || data.files.length === 0) {
+            el.innerHTML = '<div class="hint">共享目录为空</div>';
+            return;
+        }
+        el.innerHTML = "";
+        data.files.forEach(f => {
+            const row = document.createElement("div");
+            row.className = "row";
+            const info = document.createElement("span");
+            info.innerHTML = f.name + " <span style='color:#999;font-size:12px'>" + fmtSize(f.size) + "</span>";
+            const a = document.createElement("a");
+            a.className = "btn";
+            a.href = "/download/" + encodeURIComponent(f.name);
+            a.textContent = "下载";
+            a.style.margin = "0";
+            a.style.padding = "6px 14px";
+            row.appendChild(info);
+            row.appendChild(a);
+            el.appendChild(row);
+        });
+    } catch (e) {
+        el.innerHTML = '<div class="err" style="padding:6px">加载失败: ' + e.message + '</div>';
+    }
+}
+loadFiles();
+
+function set(id, text, cls) {
+    const el = document.getElementById(id);
+    el.textContent = text;
+    el.className = "status " + (cls || "warn");
+}
+
+async function connect() {
+    document.getElementById("btn-connect").disabled = true;
+    document.getElementById("btn-disconnect").disabled = false;
+    let offerRetries = 0;
+
+    // 1. 连接 WebSocket 信令
+    set("ws-status", "连接中...", "warn");
+    log("连接 WebSocket 信令...");
+    const proto = location.protocol === "https:" ? "wss:" : "ws:";
+    ws = new WebSocket(proto + "//" + location.host + "/ws");
+
+    ws.onopen = () => {
+        set("ws-status", "已连接", "ok");
+        log("WebSocket 已连接", "i");
+        // 信令通道就绪后立即发 offer（避免 CONNECTING 状态发送失败）
+        sendOffer();
+    };
+    ws.onclose = () => {
+        set("ws-status", "已断开", "err");
+        log("WebSocket 已断开", "e");
+    };
+    ws.onerror = () => {
+        set("ws-status", "错误", "err");
+        log("WebSocket 错误", "e");
+    };
+    ws.onmessage = (ev) => handleSignaling(ev.data);
+
+    // 2. 创建 WebRTC PeerConnection
+    set("rtc-status", "创建中...", "warn");
+    try {
+        pc = new RTCPeerConnection({iceServers: STUN});
+        log("创建 WebRTC PeerConnection");
+    } catch (e) {
+        pc = null;
+        set("rtc-status", "创建失败: " + e.message, "err");
+        log("创建 WebRTC PeerConnection 失败: " + e.message, "e");
+        return;  // 无法继续，退出 connect
+    }
+
+    // 2.5 浏览器主动创建数据通道（文件传输用）
+    try {
+        channel = pc.createDataChannel("files", {ordered: true});
+        log("创建数据通道: files");
+        channel.onopen = () => {
+            set("ch-status", "已开放", "ok");
+            log("数据通道已开放", "i");
+        };
+        channel.onclose = () => {
+            set("ch-status", "已关闭", "err");
+            log("数据通道已关闭", "e");
+        };
+        channel.onmessage = (ev) => {
+            log("收到电脑端: " + ev.data, "i");
+        };
+    } catch (e) {
+        log("创建数据通道失败: " + e.message, "e");
+    }
+
+    // 3. 监听 ICE 状态
+    pc.oniceconnectionstatechange = () => {
+        const s = pc.iceConnectionState;
+        const cls = s === "connected" ? "ok" : (s === "failed" || s === "closed" ? "err" : "warn");
+        set("ice-status", s, cls);
+        log("ICE 状态: " + s, cls === "err" ? "e" : "i");
+    };
+
+    // 4. 监听数据通道（电脑端可能创建）
+    pc.ondatachannel = (ev) => {
+        channel = ev.channel;
+        set("ch-status", "已开放", "ok");
+        log("电脑端创建数据通道: " + channel.label, "i");
+        channel.onmessage = (ev) => {
+            log("收到电脑端: " + ev.data, "i");
+        };
+        channel.onclose = () => {
+            set("ch-status", "已关闭", "err");
+        };
+    };
+
+    // 5. 创建并发送 offer（由 ws.onopen 触发，保证信令通道就绪）
+    async function sendOffer() {
+        try {
+            if (!pc) {
+                set("rtc-status", "此浏览器不支持 WebRTC", "err");
+                log("此浏览器不支持 WebRTC，文件下载仍走 Cloudflare 中继", "w");
+                return;
+            }
+            if (!ws || ws.readyState !== 1) {
+                offerRetries++;
+                if (offerRetries > 20) {
+                    log("信令通道 10 秒内未就绪，放弃重试", "e");
+                    return;
+                }
+                log("信令通道未就绪，稍后重试 offer", "w");
+                setTimeout(() => {
+                    if (ws && ws.readyState === 1 && pc) sendOffer();
+                }, 500);
+                return;
+            }
+            const offer = await pc.createOffer();
+            await pc.setLocalDescription(offer);
+            log("创建 offer，发送给电脑端");
+
+            // 6. 发送 offer
+            ws.send(JSON.stringify({
+                type: "offer",
+                sdp: offer.sdp
+            }));
+
+            // 7. 发送 ICE 候选（逐个）
+            pc.onicecandidate = (ev) => {
+                if (ev.candidate && ws.readyState === 1) {
+                    ws.send(JSON.stringify({
+                        type: "ice",
+                        candidate: ev.candidate.candidate,
+                        sdpMid: ev.candidate.sdpMid,
+                        sdpMLineIndex: ev.candidate.sdpMLineIndex
+                    }));
+            }
+        };
+    } catch (e) {
+        log("创建 offer 失败: " + e.message, "e");
+    }
+    }
+}
+
+async function handleSignaling(json) {
+    try {
+        const data = JSON.parse(json);
+        if (data.type === "answer") {
+            await pc.setRemoteDescription({sdp: data.sdp, type: data.desc_type});
+            log("收到 answer", "i");
+        } else if (data.type === "ice") {
+            await pc.addIceCandidate({
+                candidate: data.candidate,
+                sdpMid: data.sdpMid,
+                sdpMLineIndex: data.sdpMLineIndex
+            });
+        } else if (data.type === "ice-state") {
+            log("电脑端 ICE 状态: " + data.state, "i");
+        } else if (data.type === "channel-open") {
+            set("ch-status", "已开放", "ok");
+            document.getElementById("btn-test").disabled = false;
+            log("电脑端数据通道已开放: " + data.label, "i");
+        } else if (data.type === "echo") {
+            log("电脑端 echo: " + data.msg, "i");
+        }
+    } catch (e) {
+        log("信令解析错误: " + e.message, "e");
+    }
+}
+
+function sendTest() {
+    if (channel && channel.readyState === "open") {
+        const msg = "hello from browser " + Date.now();
+        channel.send(msg);
+        log("发送测试消息: " + msg);
+    } else {
+        log("数据通道未建立", "e");
+    }
+}
+
+function disconnect() {
+    if (ws) ws.close();
+    if (pc) pc.close();
+    ws = pc = channel = null;
+    set("ws-status", "未连接", "warn");
+    set("rtc-status", "未建立", "warn");
+    set("ice-status", "未开始", "warn");
+    set("ch-status", "未建立", "warn");
+    document.getElementById("btn-connect").disabled = false;
+    document.getElementById("btn-disconnect").disabled = true;
+    document.getElementById("btn-test").disabled = true;
+    log("已断开");
+}
+</script>
+</body>
+</html>
